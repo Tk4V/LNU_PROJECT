@@ -1,0 +1,41 @@
+# Ignore environment files and folders
+.env
+/env
+
+# Ignore SQLite database
+db.sqlite3
+
+# Ignore Python test scripts and temporary files
+test_audio.py
+
+# Ignore audio output files
+output.mp3
+
+# Ignore common Python artifacts
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.log
+
+# Ignore virtual environments
+venv/
+ENV/
+env/
+
+# Ignore cache and temporary files
+*.bak
+*.swp
+.DS_Store
+
+# Ignore coverage and testing reports
+coverage.xml
+htmlcov/
+.coverage
+
+# Ignore Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+
+# Ignore system files
+Thumbs.db
+desktop.ini
