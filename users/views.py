@@ -1,6 +1,6 @@
 from rest_framework.views import APIView
 from rest_framework.response import Response
-from rest_framework.exceptions import AuthenticationFailed
+from rest_framework.exceptions import AuthenticationFailed, ValidationError
 from .serializers import UserSerializer
 from .models import User
 from gtts import gTTS
@@ -13,9 +13,15 @@ import os
 from django.conf import settings
 from django.http import JsonResponse
 from dotenv import load_dotenv
+import requests
 
 
+load_dotenv()
 
+openai.api_key = os.getenv("OPENAI_API_KEY")
+
+if not openai.api_key:
+    raise EnvironmentError("OPENAI_API_KEY environment variable is not set!")
 
 
 
@@ -29,43 +35,36 @@ class RegisterView(APIView):
 
 class LoginView(APIView):
     def post(self, request):
-        email = request.data['email']
-        password = request.data['password']
+        email = request.data.get('email')  # Retrieve email from the request
+        password = request.data.get('password')  # Retrieve password from the request
 
-        
+        # Check if a user with the provided email exists
         user = User.objects.filter(email=email).first()
-
-        
         if user is None:
             raise AuthenticationFailed('User not found!')
 
-        
+        # Verify the password
         if not user.check_password(password):
             raise AuthenticationFailed('Incorrect password!')
 
-        
+        # Generate the JWT payload
         payload = {
             'id': user.id,
-            'exp': datetime.datetime.utcnow() + datetime.timedelta(minutes=60),
-            'iat': datetime.datetime.utcnow()
+            'exp': datetime.datetime.utcnow() + datetime.timedelta(minutes=60),  # Expiration time
+            'iat': datetime.datetime.utcnow()  # Issued at time
         }
 
-       
+        # Generate a JWT token
         token = jwt.encode(payload, 'secret', algorithm='HS256')
 
-        
+        # Create the response object
         response = Response()
-
-        
-        response.set_cookie(key='jwt', value=token, httponly=True)
-
-        
+        response.set_cookie(key='jwt', value=token, httponly=True)  # Set token as an HTTP-only cookie
         response.data = {
-            'jwt': token
+            'jwt': token  # Include the token in the response
         }
 
         return response
-
 
 class UserView(APIView):
     def get(self, request):
@@ -104,51 +103,13 @@ class LogoutView(APIView):
         return response
 
 
-load_dotenv()
-
-openai.api_key = os.getenv("OPENAI_API_KEY")
-
-if not openai.api_key:
-    raise EnvironmentError("OPENAI_API_KEY environment variable is not set!")
 
 class GPTView(APIView):
-    def get(self, request):
-        token = request.COOKIES.get('jwt')
-        
-        if not token:
-            raise AuthenticationFailed('Unauthenticated!')
-
-        try:
-            payload = jwt.decode(token, 'secret', algorithms=['HS256'])
-        except jwt.ExpiredSignatureError:
-            raise AuthenticationFailed('Token has expired!')
-        except jwt.InvalidTokenError:
-            raise AuthenticationFailed('Invalid token!')
-
-        user_id = payload.get('id')
-        if not user_id:
-            raise AuthenticationFailed('User not found!')
-
-        recent_logs = GPTMessageLog.objects.filter(user_id=user_id).order_by('-timestamp')[:10]
-        
-        logs_data = [
-            {
-                "prompt": log.prompt,
-                "response": log.gpt_response,
-                "timestamp": log.timestamp
-            }
-            for log in recent_logs
-        ]
-
-        return Response({
-            "user_id": user_id,
-            "recent_logs": logs_data
-        })
-
-    # Handle POST requests
+    """
+    DRF view to handle GPT interactions: send prompt, save response, and return data.
+    """
     def post(self, request):
-        print("Request received: ", request.data)
-        
+        # Authenticate the user
         token = request.COOKIES.get('jwt')
         if not token:
             raise AuthenticationFailed('Unauthenticated!')
@@ -164,77 +125,42 @@ class GPTView(APIView):
         if not user_id:
             raise AuthenticationFailed('User not found!')
 
+        # Validate the prompt
         prompt = request.data.get('prompt')
         if not prompt:
-            raise AuthenticationFailed('Prompt is required!')
+            raise ValidationError('Prompt is required!')
 
         try:
-            print(f"Prompt received: {prompt}")
-            completion = openai.ChatCompletion.create(
-                model="gpt-4",
-                messages=[
-                    {
-                        "role": "user",
-                        "content": f"""відповідай дуже коротко до 20 слів,
-                        Ти мені повинен довомогти вивчитись мови,
-                        ось що я тебе прошу (Відповідай та тій мові яка іде далі):
-                        {prompt}"""
-                    }
-                ]
+            # Send prompt to microservice
+            microservice_url = "http://127.0.0.1:8001/items/"
+            response = requests.post(
+                microservice_url,
+                json={"prompt": prompt}
             )
+            response.raise_for_status()  # Raise an exception for HTTP errors
 
-            chat_response = completion['choices'][0]['message']['content']
-            print(f"Chat response: {chat_response}")
+            # Extract response data
+            response_data = response.json()
+            answer = response_data.get("answer")
+            voice_base64 = response_data.get("voice")
 
+            # Save the data to the database
             GPTMessageLog.objects.create(
                 user_id=user_id,
                 prompt=prompt,
-                gpt_response=chat_response,
-                timestamp=datetime.datetime.now()
+                gpt_response=answer,
+                timestamp=datetime.datetime.now(),
             )
 
+            # Return the response to the user
             return Response({
-                "answer": chat_response,
+                "answer": answer,
                 "category": "new",
                 "date": datetime.datetime.now(),
+                "voice": voice_base64
             })
 
+        except requests.exceptions.RequestException as e:
+            raise ValidationError(f"Error communicating with microservice: {str(e)}")
         except Exception as e:
-            raise AuthenticationFailed(f"Error processing the request: {str(e)}")
-class AudioView(APIView):
-    def post(self, request):
-        try:
-            token = request.COOKIES.get('jwt')
-            if not token:
-                raise AuthenticationFailed('Unauthenticated!')
-
-            payload = jwt.decode(token, 'secret', algorithms=['HS256'])
-            user_id = str(payload.get('id'))
-            if not user_id:
-                raise AuthenticationFailed('Invalid user!')
-
-            prompt = request.data.get('prompt')
-            if not prompt:
-                return JsonResponse({"error": "Prompt is required!"}, status=400)
-
-  
-            safe_prompt = prompt.replace(" ", "_").replace("/", "_").replace("\\", "_")
-            audio_file_path = os.path.join(settings.MEDIA_ROOT, 'audio', f"{user_id}_{safe_prompt}.mp3")
-
-  
-            os.makedirs(os.path.dirname(audio_file_path), exist_ok=True)
-
-   
-            if not os.path.exists(audio_file_path):
-                chat_response = f"Response based on the prompt: {prompt}"  # Replace with actual logic if needed
-                tts = gTTS(text=chat_response, lang='uk')
-                tts.save(audio_file_path)
-
-            return FileResponse(open(audio_file_path, 'rb'), content_type='audio/mp3')
-
-        except jwt.ExpiredSignatureError:
-            raise AuthenticationFailed('Token has expired!')
-        except jwt.InvalidTokenError:
-            raise AuthenticationFailed('Invalid token!')
-        except Exception as e:
-            return JsonResponse({"error": f"Error generating audio: {str(e)}"}, status=500)
+            raise ValidationError(f"An unexpected error occurred: {str(e)}")

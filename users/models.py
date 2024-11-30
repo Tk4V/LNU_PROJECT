@@ -1,6 +1,7 @@
 from django.db import models
 from django.contrib.auth.models import AbstractUser, UserManager as DefaultUserManager
 from django.conf import settings
+import pytz
 
 
 
@@ -39,4 +40,7 @@ class GPTMessageLog(models.Model):
     timestamp = models.DateTimeField(auto_now_add=True)  
 
     def __str__(self):
-        return f"Log from {self.user} at {self.timestamp}"
+        # Convert timestamp to Europe/Kiev timezone
+        kiev_tz = pytz.timezone('Europe/Kiev')
+        timestamp_in_kiev = self.timestamp.astimezone(kiev_tz)
+        return f"Log from {self.user} at {timestamp_in_kiev.strftime('%Y-%m-%d %H:%M:%S')}"
