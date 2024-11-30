@@ -2,28 +2,15 @@ from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework.exceptions import AuthenticationFailed, ValidationError
 from .serializers import UserSerializer
-from .models import User
-from gtts import gTTS
-import jwt, datetime
-import openai
+from .models import User, GPTMessageLog
 import datetime
-import base64
-from .models import GPTMessageLog 
 import os
-from django.conf import settings
-from django.http import JsonResponse
+import secrets  # For generating secure random tokens
 from dotenv import load_dotenv
 import requests
-
+from django.utils import timezone
 
 load_dotenv()
-
-openai.api_key = os.getenv("OPENAI_API_KEY")
-
-if not openai.api_key:
-    raise EnvironmentError("OPENAI_API_KEY environment variable is not set!")
-
-
 
 class RegisterView(APIView):
     def post(self, request):
@@ -32,131 +19,106 @@ class RegisterView(APIView):
         serializer.save()
         return Response(serializer.data)
 
-
 class LoginView(APIView):
     def post(self, request):
-        email = request.data.get('email')  # Retrieve email from the request
-        password = request.data.get('password')  # Retrieve password from the request
+        email = request.data.get('email')
+        password = request.data.get('password')
 
-        # Check if a user with the provided email exists
         user = User.objects.filter(email=email).first()
         if user is None:
             raise AuthenticationFailed('User not found!')
 
-        # Verify the password
         if not user.check_password(password):
             raise AuthenticationFailed('Incorrect password!')
 
-        # Generate the JWT payload
-        payload = {
-            'id': user.id,
-            'exp': datetime.datetime.utcnow() + datetime.timedelta(minutes=60),  # Expiration time
-            'iat': datetime.datetime.utcnow()  # Issued at time
-        }
+        # Generate a secure token (example length: 32 characters)
+        token = secrets.token_hex(32)
 
-        # Generate a JWT token
-        token = jwt.encode(payload, 'secret', algorithm='HS256')
+        # Save token to the user object or a separate Token model
+        user.token = token  # Ensure 'token' field exists in the User model or create a Token model
+        user.token_expiration = datetime.datetime.now() + datetime.timedelta(hours=1)
+        user.save()
 
-        # Create the response object
-        response = Response()
-        response.set_cookie(key='jwt', value=token, httponly=True)  # Set token as an HTTP-only cookie
-        response.data = {
-            'jwt': token  # Include the token in the response
-        }
-
-        return response
-
-class UserView(APIView):
-    def get(self, request):
-        token = request.COOKIES.get('jwt')
-
-        if not token:
-            raise AuthenticationFailed('Unauthenticated!')
-
-        try:
-            # Decode the token using the specified algorithm
-            payload = jwt.decode(token, 'secret', algorithms=['HS256'])  # Corrected 'algorithms' argument
-        except jwt.ExpiredSignatureError:
-            raise AuthenticationFailed('Token has expired!')
-
-        except jwt.InvalidTokenError:
-            raise AuthenticationFailed('Invalid token!')
-
-        # Get the user from the decoded payload
-        user = User.objects.filter(id=payload['id']).first()
-        
-        if not user:
-            raise AuthenticationFailed('User not found!')
-
-        # Serialize the user data
-        serializer = UserSerializer(user)
-
-        return Response(serializer.data)
+        return Response({'token': token})  # Return the token to the client
 
 class LogoutView(APIView):
     def post(self, request):
-        response = Response()
-        response.delete_cookie('jwt')
-        response.data = {
-            'message': 'success'
-        }
-        return response
+        # Extract the Bearer token from the Authorization header
+        auth_header = request.headers.get('Authorization')
+        if not auth_header or not auth_header.startswith('Bearer '):
+            raise AuthenticationFailed('No Bearer token provided!')
 
+        token = auth_header.split(' ')[1]
+
+        # Find the user associated with this token
+        user = User.objects.filter(token=token).first()
+        if not user:
+            raise AuthenticationFailed('Invalid token!')
+
+        # Invalidate the token by clearing it
+        user.token = None
+        user.token_expiration = None
+        user.save()
+
+        return Response({'message': 'Successfully logged out!'})
+
+
+class UserView(APIView):
+    def get(self, request):
+        # Extract Bearer token from the Authorization header
+        auth_header = request.headers.get('Authorization')
+        if not auth_header or not auth_header.startswith('Bearer '):
+            raise AuthenticationFailed('No Bearer token provided!')
+
+        token = auth_header.split(' ')[1]
+
+        # Validate the token
+        user = User.objects.filter(token=token).first()
+        if not user or user.token_expiration < datetime.datetime.now():
+            raise AuthenticationFailed('Invalid or expired token!')
+
+        serializer = UserSerializer(user)
+        return Response(serializer.data)
 
 
 class GPTView(APIView):
-    """
-    DRF view to handle GPT interactions: send prompt, save response, and return data.
-    """
     def post(self, request):
-        # Authenticate the user
-        token = request.COOKIES.get('jwt')
-        if not token:
-            raise AuthenticationFailed('Unauthenticated!')
+        # Authenticate using Bearer token
+        auth_header = request.headers.get('Authorization')
+        if not auth_header or not auth_header.startswith('Bearer '):
+            raise AuthenticationFailed('No Bearer token provided!')
 
-        try:
-            payload = jwt.decode(token, 'secret', algorithms=['HS256'])
-        except jwt.ExpiredSignatureError:
-            raise AuthenticationFailed('Token has expired!')
-        except jwt.InvalidTokenError:
-            raise AuthenticationFailed('Invalid token!')
+        token = auth_header.split(' ')[1]
+        user = User.objects.filter(token=token).first()
+        if not user or user.token_expiration < timezone.now():  # Use timezone-aware now()
+            raise AuthenticationFailed('Invalid or expired token!')
 
-        user_id = payload.get('id')
-        if not user_id:
-            raise AuthenticationFailed('User not found!')
-
-        # Validate the prompt
+        # Validate and process the prompt
         prompt = request.data.get('prompt')
         if not prompt:
             raise ValidationError('Prompt is required!')
 
         try:
-            # Send prompt to microservice
-            microservice_url = "http://127.0.0.1:8001/items/"
-            response = requests.post(
-                microservice_url,
-                json={"prompt": prompt}
-            )
-            response.raise_for_status()  # Raise an exception for HTTP errors
+            microservice_url = "http://16.171.159.54:8000/items/"
+            response = requests.post(microservice_url, json={"prompt": prompt})
+            response.raise_for_status()
 
-            # Extract response data
             response_data = response.json()
             answer = response_data.get("answer")
             voice_base64 = response_data.get("voice")
 
             # Save the data to the database
             GPTMessageLog.objects.create(
-                user_id=user_id,
+                user_id=user.id,
                 prompt=prompt,
                 gpt_response=answer,
-                timestamp=datetime.datetime.now(),
+                timestamp=timezone.now(),  # Ensure timezone-aware timestamp
             )
 
-            # Return the response to the user
             return Response({
                 "answer": answer,
                 "category": "new",
-                "date": datetime.datetime.now(),
+                "date": timezone.now(),  # Ensure timezone-aware timestamp
                 "voice": voice_base64
             })
 
